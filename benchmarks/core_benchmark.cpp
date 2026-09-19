@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -320,104 +321,26 @@ BenchmarkResult run_batched_benchmark(const std::string& name,
                       "batched");
 }
 
-BenchmarkResult run_spsc_two_thread_benchmark(const BenchmarkOptions& options) {
-  const int producer_cpu = normalize_cpu(options.affinity_cpu);
-  const int consumer_cpu =
-      options.affinity_cpu < 0 ? -1 : normalize_cpu(options.affinity_cpu + 1);
-
-  const auto warmup_batches =
-      split_iterations(options.warmup_iterations, options.batch_size);
-  const auto measured_batches =
-      split_iterations(options.iterations, options.batch_size);
-
-  std::vector<std::uint64_t> all_batches;
-  all_batches.reserve(warmup_batches.size() + measured_batches.size());
-  all_batches.insert(all_batches.end(), warmup_batches.begin(), warmup_batches.end());
-  all_batches.insert(all_batches.end(), measured_batches.begin(), measured_batches.end());
-
-  std::vector<std::chrono::steady_clock::time_point> batch_start(all_batches.size());
-  std::vector<std::chrono::steady_clock::time_point> batch_end(all_batches.size());
-
-  lolakit::core::SpscRingBuffer<std::uint64_t, 1024> queue;
-  std::uint64_t consumer_sum = 0U;
-  bool producer_affinity_applied = false;
-  bool consumer_affinity_applied = false;
-
-  std::thread producer([&]() {
-    ThreadAffinityScope affinity_scope(producer_cpu);
-    producer_affinity_applied = affinity_scope.applied();
-    lolakit::core::SpinWait wait;
-    std::uint64_t next_value = 0U;
-
-    for (std::size_t batch = 0; batch < all_batches.size(); ++batch) {
-      batch_start[batch] = std::chrono::steady_clock::now();
-      for (std::uint64_t i = 0; i < all_batches[batch]; ++i) {
-        while (!queue.try_push(next_value)) {
-          wait.pause();
-        }
-        ++next_value;
-        wait.reset();
-      }
-    }
-  });
-
-  std::thread consumer([&]() {
-    ThreadAffinityScope affinity_scope(consumer_cpu);
-    consumer_affinity_applied = affinity_scope.applied();
-    lolakit::core::SpinWait wait;
-
-    for (std::size_t batch = 0; batch < all_batches.size(); ++batch) {
-      for (std::uint64_t i = 0; i < all_batches[batch]; ++i) {
-        auto value = queue.try_pop();
-        while (!value.has_value()) {
-          wait.pause();
-          value = queue.try_pop();
-        }
-        consumer_sum += *value;
-        wait.reset();
-      }
-      batch_end[batch] = std::chrono::steady_clock::now();
-    }
-  });
-
-  producer.join();
-  consumer.join();
-
-  g_benchmark_sink ^= consumer_sum;
-
-  std::vector<BatchSample> samples;
-  samples.reserve(measured_batches.size());
-  const std::size_t warmup_count = warmup_batches.size();
-  for (std::size_t i = 0; i < measured_batches.size(); ++i) {
-    const std::size_t batch_index = warmup_count + i;
-    const double total_ns = static_cast<double>(std::chrono::duration_cast<
-        std::chrono::nanoseconds>(batch_end[batch_index] - batch_start[batch_index])
-                                                    .count());
-    const std::uint64_t operations = measured_batches[i];
-    samples.push_back(
-        BatchSample{operations, total_ns,
-                    total_ns / static_cast<double>(operations)});
-  }
-
-  const std::string affinity =
-      describe_affinity(producer_cpu, producer_affinity_applied) + "/" +
-      describe_affinity(consumer_cpu, consumer_affinity_applied);
-  return build_result("spsc_two_thread", options, samples, affinity,
-                      "producer_consumer_end_to_end");
+std::pair<std::vector<std::uint64_t>, std::vector<std::uint64_t>>
+prepare_two_thread_batches(const BenchmarkOptions& options) {
+  return std::make_pair(
+      split_iterations(options.warmup_iterations, options.batch_size),
+      split_iterations(options.iterations, options.batch_size));
 }
 
-template <typename QueueT>
-BenchmarkResult run_generic_two_thread_benchmark(const std::string& name,
-                                                 const BenchmarkOptions& options,
-                                                 const std::string& notes) {
+template <typename QueueT, typename ProducerFn, typename ConsumerFn>
+BenchmarkResult run_two_thread_benchmark(const std::string& name,
+                                         const BenchmarkOptions& options,
+                                         const std::string& notes,
+                                         ProducerFn&& producer_fn,
+                                         ConsumerFn&& consumer_fn) {
   const int producer_cpu = normalize_cpu(options.affinity_cpu);
   const int consumer_cpu =
       options.affinity_cpu < 0 ? -1 : normalize_cpu(options.affinity_cpu + 1);
 
-  const auto warmup_batches =
-      split_iterations(options.warmup_iterations, options.batch_size);
-  const auto measured_batches =
-      split_iterations(options.iterations, options.batch_size);
+  const auto batch_pair = prepare_two_thread_batches(options);
+  const auto& warmup_batches = batch_pair.first;
+  const auto& measured_batches = batch_pair.second;
 
   std::vector<std::uint64_t> all_batches;
   all_batches.reserve(warmup_batches.size() + measured_batches.size());
@@ -441,7 +364,7 @@ BenchmarkResult run_generic_two_thread_benchmark(const std::string& name,
     for (std::size_t batch = 0; batch < all_batches.size(); ++batch) {
       batch_start[batch] = std::chrono::steady_clock::now();
       for (std::uint64_t i = 0; i < all_batches[batch]; ++i) {
-        while (!queue.try_push(next_value)) {
+        while (!producer_fn(queue, next_value, wait)) {
           wait.pause();
         }
         ++next_value;
@@ -457,10 +380,10 @@ BenchmarkResult run_generic_two_thread_benchmark(const std::string& name,
 
     for (std::size_t batch = 0; batch < all_batches.size(); ++batch) {
       for (std::uint64_t i = 0; i < all_batches[batch]; ++i) {
-        auto value = queue.try_pop();
+        auto value = consumer_fn(queue, wait);
         while (!value.has_value()) {
           wait.pause();
-          value = queue.try_pop();
+          value = consumer_fn(queue, wait);
         }
         consumer_sum += *value;
         wait.reset();
@@ -492,6 +415,29 @@ BenchmarkResult run_generic_two_thread_benchmark(const std::string& name,
       describe_affinity(producer_cpu, producer_affinity_applied) + "/" +
       describe_affinity(consumer_cpu, consumer_affinity_applied);
   return build_result(name, options, samples, affinity, notes);
+}
+
+template <typename QueueT>
+BenchmarkResult run_generic_two_thread_benchmark(const std::string& name,
+                                                 const BenchmarkOptions& options,
+                                                 const std::string& notes) {
+  auto producer_op = [](QueueT& queue, std::uint64_t next_value,
+                        lolakit::core::SpinWait& /*wait*/) -> bool {
+    return queue.try_push(next_value);
+  };
+  auto consumer_op = [](QueueT& queue,
+                        lolakit::core::SpinWait& /*wait*/) -> std::optional<std::uint64_t> {
+    return queue.try_pop();
+  };
+  return run_two_thread_benchmark<QueueT>(name, options, notes,
+                                          std::move(producer_op),
+                                          std::move(consumer_op));
+}
+
+BenchmarkResult run_spsc_two_thread_benchmark(const BenchmarkOptions& options) {
+  return run_generic_two_thread_benchmark<
+      lolakit::core::SpscRingBuffer<std::uint64_t, 1024>>(
+      "spsc_two_thread", options, "producer_consumer_end_to_end");
 }
 
 BenchmarkResult run_mutex_vector_spsc_two_thread_benchmark(
@@ -733,6 +679,32 @@ void write_csv(const std::string& csv_path,
   }
 }
 
+void print_progress_header(std::size_t total) {
+  std::cout << "progress: running " << total << " benchmarks; "
+            << "each line prints mean/p50/p95/p99 (ns/op)\n"
+            << std::flush;
+}
+
+void print_progress_start(std::size_t index, std::size_t total,
+                          const std::string& name) {
+  std::cout << "[" << std::setw(2) << (index + 1) << "/" << total << "] "
+            << std::left << std::setw(48) << name << " ... " << std::flush;
+}
+
+void print_progress_result(const BenchmarkResult& result) {
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(2);
+  oss << "mean=" << std::setw(10) << result.mean_ns_per_op
+      << "  p50=" << std::setw(10) << result.p50_ns_per_op
+      << "  p95=" << std::setw(10) << result.p95_ns_per_op
+      << "  p99=" << std::setw(10) << result.p99_ns_per_op;
+  if (result.mops > 0.0) {
+    oss << "  " << std::setprecision(2)
+        << std::setw(8) << result.mops << " Mops/s";
+  }
+  std::cout << oss.str() << "\n" << std::flush;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -742,203 +714,259 @@ int main(int argc, char** argv) {
 
     lolakit::core::TscClock::initialize(std::chrono::milliseconds(1));
 
+    const std::size_t kBenchmarkCount = 20;
+    print_progress_header(kBenchmarkCount);
+    std::size_t idx = 0;
+
+    auto run_with_progress =
+        [&](const std::string& name,
+            const std::function<BenchmarkResult(void)>& run) -> BenchmarkResult {
+          print_progress_start(idx++, kBenchmarkCount, name);
+          BenchmarkResult result = run();
+          print_progress_result(result);
+          return result;
+        };
+
     std::vector<BenchmarkResult> results;
-    results.push_back(run_batched_benchmark(
-        "atomic_fetch_add_relaxed", options, normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::Atomic<std::uint64_t> counter(0U);
-          std::uint64_t local_sum = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            local_sum += lolakit::core::atomic_fetch_add_relaxed(
-                counter, std::uint64_t{1});
-          }
-          return local_sum;
-        }));
+    results.reserve(kBenchmarkCount);
 
-    results.push_back(run_batched_benchmark(
-        "tsc_now_cycles", options, normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          std::uint64_t local_sum = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            local_sum += lolakit::core::TscClock::now_cycles();
-          }
-          return local_sum;
-        }));
-
-    results.push_back(run_batched_benchmark(
-        "singleton_magic_static", options, normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          std::uint64_t local_sum = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            local_sum ^= benchmark_magic_singleton_access();
-          }
-          return local_sum;
-        }));
-
-    results.push_back(run_batched_benchmark(
-        "singleton_dclp", options, normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          std::uint64_t local_sum = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            local_sum ^= benchmark_dclp_singleton_access();
-          }
-          return local_sum;
-        }));
-
-    results.push_back(run_batched_benchmark(
-        "spsc_single_thread", options, normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::SpscRingBuffer<std::uint64_t, 1024> queue;
-          std::uint64_t local_sum = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            while (!queue.try_push(i)) {
+    results.push_back(run_with_progress("atomic_fetch_add_relaxed", [&] {
+      return run_batched_benchmark(
+          "atomic_fetch_add_relaxed", options, normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            lolakit::core::Atomic<std::uint64_t> counter(0U);
+            std::uint64_t local_sum = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              local_sum += lolakit::core::atomic_fetch_add_relaxed(
+                  counter, std::uint64_t{1});
             }
-            auto value = queue.try_pop();
-            LOLAKIT_ASSERT(value.has_value());
-            local_sum += *value;
-          }
-          return local_sum;
-        }));
+            return local_sum;
+          });
+    }));
 
-    results.push_back(run_batched_benchmark(
-        "spsc_single_thread_out_param", options,
-        normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::SpscRingBuffer<std::uint64_t, 1024> queue;
-          std::uint64_t local_sum = 0U;
-          std::uint64_t value = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            while (!queue.try_push(i)) {
+    results.push_back(run_with_progress("tsc_now_cycles", [&] {
+      return run_batched_benchmark(
+          "tsc_now_cycles", options, normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            std::uint64_t local_sum = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              local_sum += lolakit::core::TscClock::now_cycles();
             }
-            LOLAKIT_ASSERT(queue.try_pop(value));
-            local_sum += value;
-          }
-          return local_sum;
-        }));
+            return local_sum;
+          });
+    }));
 
-    results.push_back(run_batched_benchmark(
-        "trivial_spsc_single_thread", options,
-        normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::TrivialSpscRingBuffer<std::uint64_t, 1024> queue;
-          std::uint64_t local_sum = 0U;
-          std::uint64_t value = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            while (!queue.try_push(i)) {
+    results.push_back(run_with_progress("singleton_magic_static", [&] {
+      return run_batched_benchmark(
+          "singleton_magic_static", options, normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            std::uint64_t local_sum = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              local_sum ^= benchmark_magic_singleton_access();
             }
-            LOLAKIT_ASSERT(queue.try_pop(value));
-            local_sum += value;
-          }
-          return local_sum;
-        }));
+            return local_sum;
+          });
+    }));
 
-    results.push_back(run_batched_benchmark(
-        "mutex_vector_spsc_single_thread", options,
-        normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::MutexVectorSpscQueue<std::uint64_t, 1024> queue;
-          std::uint64_t local_sum = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            while (!queue.try_push(i)) {
+    results.push_back(run_with_progress("singleton_dclp", [&] {
+      return run_batched_benchmark(
+          "singleton_dclp", options, normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            std::uint64_t local_sum = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              local_sum ^= benchmark_dclp_singleton_access();
             }
-            auto value = queue.try_pop();
-            LOLAKIT_ASSERT(value.has_value());
-            local_sum += *value;
-          }
-          return local_sum;
-        }));
+            return local_sum;
+          });
+    }));
 
-    results.push_back(run_batched_benchmark(
-        "mutex_vector_spsc_single_thread_out_param", options,
-        normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::MutexVectorSpscQueue<std::uint64_t, 1024> queue;
-          std::uint64_t local_sum = 0U;
-          std::uint64_t value = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            while (!queue.try_push(i)) {
+    results.push_back(run_with_progress("spsc_single_thread", [&] {
+      return run_batched_benchmark(
+          "spsc_single_thread", options, normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            lolakit::core::SpscRingBuffer<std::uint64_t, 1024> queue;
+            std::uint64_t local_sum = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              while (!queue.try_push(i)) {
+              }
+              auto value = queue.try_pop();
+              LOLAKIT_ASSERT(value.has_value());
+              local_sum += *value;
             }
-            LOLAKIT_ASSERT(queue.try_pop(value));
-            local_sum += value;
-          }
-          return local_sum;
-        }));
+            return local_sum;
+          });
+    }));
 
-    results.push_back(run_batched_benchmark(
-        "trivial_mutex_vector_spsc_single_thread", options,
-        normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::TrivialMutexVectorSpscQueue<std::uint64_t, 1024> queue;
-          std::uint64_t local_sum = 0U;
-          std::uint64_t value = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            while (!queue.try_push(i)) {
+    results.push_back(run_with_progress("spsc_single_thread_out_param", [&] {
+      return run_batched_benchmark(
+          "spsc_single_thread_out_param", options,
+          normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            lolakit::core::SpscRingBuffer<std::uint64_t, 1024> queue;
+            std::uint64_t local_sum = 0U;
+            std::uint64_t value = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              while (!queue.try_push(i)) {
+              }
+              LOLAKIT_ASSERT(queue.try_pop(value));
+              local_sum += value;
             }
-            LOLAKIT_ASSERT(queue.try_pop(value));
-            local_sum += value;
-          }
-          return local_sum;
-        }));
+            return local_sum;
+          });
+    }));
 
-    results.push_back(run_batched_benchmark(
-        "vector_spsc_single_thread", options,
-        normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::VectorSpscRingBuffer<std::uint64_t, 1024> queue;
-          std::uint64_t local_sum = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            while (!queue.try_push(i)) {
+    results.push_back(run_with_progress("trivial_spsc_single_thread", [&] {
+      return run_batched_benchmark(
+          "trivial_spsc_single_thread", options,
+          normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            lolakit::core::TrivialSpscRingBuffer<std::uint64_t, 1024> queue;
+            std::uint64_t local_sum = 0U;
+            std::uint64_t value = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              while (!queue.try_push(i)) {
+              }
+              LOLAKIT_ASSERT(queue.try_pop(value));
+              local_sum += value;
             }
-            auto value = queue.try_pop();
-            LOLAKIT_ASSERT(value.has_value());
-            local_sum += *value;
-          }
-          return local_sum;
-        }));
+            return local_sum;
+          });
+    }));
 
-    results.push_back(run_batched_benchmark(
-        "vector_spsc_single_thread_out_param", options,
-        normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::VectorSpscRingBuffer<std::uint64_t, 1024> queue;
-          std::uint64_t local_sum = 0U;
-          std::uint64_t value = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            while (!queue.try_push(i)) {
+    results.push_back(run_with_progress("mutex_vector_spsc_single_thread", [&] {
+      return run_batched_benchmark(
+          "mutex_vector_spsc_single_thread", options,
+          normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            lolakit::core::MutexVectorSpscQueue<std::uint64_t, 1024> queue;
+            std::uint64_t local_sum = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              while (!queue.try_push(i)) {
+              }
+              auto value = queue.try_pop();
+              LOLAKIT_ASSERT(value.has_value());
+              local_sum += *value;
             }
-            LOLAKIT_ASSERT(queue.try_pop(value));
-            local_sum += value;
-          }
-          return local_sum;
+            return local_sum;
+          });
+    }));
+
+    results.push_back(
+        run_with_progress("mutex_vector_spsc_single_thread_out_param", [&] {
+          return run_batched_benchmark(
+              "mutex_vector_spsc_single_thread_out_param", options,
+              normalize_cpu(options.affinity_cpu),
+              [](std::uint64_t operations) {
+                lolakit::core::MutexVectorSpscQueue<std::uint64_t, 1024> queue;
+                std::uint64_t local_sum = 0U;
+                std::uint64_t value = 0U;
+                for (std::uint64_t i = 0; i < operations; ++i) {
+                  while (!queue.try_push(i)) {
+                  }
+                  LOLAKIT_ASSERT(queue.try_pop(value));
+                  local_sum += value;
+                }
+                return local_sum;
+              });
         }));
 
-    results.push_back(run_batched_benchmark(
-        "trivial_vector_spsc_single_thread", options,
-        normalize_cpu(options.affinity_cpu),
-        [](std::uint64_t operations) {
-          lolakit::core::TrivialVectorSpscRingBuffer<std::uint64_t, 1024> queue;
-          std::uint64_t local_sum = 0U;
-          std::uint64_t value = 0U;
-          for (std::uint64_t i = 0; i < operations; ++i) {
-            while (!queue.try_push(i)) {
+    results.push_back(
+        run_with_progress("trivial_mutex_vector_spsc_single_thread", [&] {
+          return run_batched_benchmark(
+              "trivial_mutex_vector_spsc_single_thread", options,
+              normalize_cpu(options.affinity_cpu),
+              [](std::uint64_t operations) {
+                lolakit::core::TrivialMutexVectorSpscQueue<std::uint64_t, 1024> queue;
+                std::uint64_t local_sum = 0U;
+                std::uint64_t value = 0U;
+                for (std::uint64_t i = 0; i < operations; ++i) {
+                  while (!queue.try_push(i)) {
+                  }
+                  LOLAKIT_ASSERT(queue.try_pop(value));
+                  local_sum += value;
+                }
+                return local_sum;
+              });
+        }));
+
+    results.push_back(run_with_progress("vector_spsc_single_thread", [&] {
+      return run_batched_benchmark(
+          "vector_spsc_single_thread", options,
+          normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            lolakit::core::VectorSpscRingBuffer<std::uint64_t, 1024> queue;
+            std::uint64_t local_sum = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              while (!queue.try_push(i)) {
+              }
+              auto value = queue.try_pop();
+              LOLAKIT_ASSERT(value.has_value());
+              local_sum += *value;
             }
-            LOLAKIT_ASSERT(queue.try_pop(value));
-            local_sum += value;
-          }
-          return local_sum;
+            return local_sum;
+          });
+    }));
+
+    results.push_back(
+        run_with_progress("vector_spsc_single_thread_out_param", [&] {
+          return run_batched_benchmark(
+              "vector_spsc_single_thread_out_param", options,
+              normalize_cpu(options.affinity_cpu),
+              [](std::uint64_t operations) {
+                lolakit::core::VectorSpscRingBuffer<std::uint64_t, 1024> queue;
+                std::uint64_t local_sum = 0U;
+                std::uint64_t value = 0U;
+                for (std::uint64_t i = 0; i < operations; ++i) {
+                  while (!queue.try_push(i)) {
+                  }
+                  LOLAKIT_ASSERT(queue.try_pop(value));
+                  local_sum += value;
+                }
+                return local_sum;
+              });
         }));
 
-    results.push_back(run_false_sharing_benchmark<UnpaddedCounters>(
-        "false_sharing_unpadded", options, "adjacent_atomic_counters"));
+    results.push_back(run_with_progress("trivial_vector_spsc_single_thread", [&] {
+      return run_batched_benchmark(
+          "trivial_vector_spsc_single_thread", options,
+          normalize_cpu(options.affinity_cpu),
+          [](std::uint64_t operations) {
+            lolakit::core::TrivialVectorSpscRingBuffer<std::uint64_t, 1024> queue;
+            std::uint64_t local_sum = 0U;
+            std::uint64_t value = 0U;
+            for (std::uint64_t i = 0; i < operations; ++i) {
+              while (!queue.try_push(i)) {
+              }
+              LOLAKIT_ASSERT(queue.try_pop(value));
+              local_sum += value;
+            }
+            return local_sum;
+          });
+    }));
 
-    results.push_back(run_false_sharing_benchmark<PaddedCounters>(
-        "false_sharing_padded", options, "cacheline_padded_atomic_counters"));
+    results.push_back(run_with_progress("false_sharing_unpadded", [&] {
+      return run_false_sharing_benchmark<UnpaddedCounters>(
+          "false_sharing_unpadded", options, "adjacent_atomic_counters");
+    }));
 
-    results.push_back(run_spsc_two_thread_benchmark(options));
-    results.push_back(run_mutex_vector_spsc_two_thread_benchmark(options));
-    results.push_back(run_vector_spsc_two_thread_benchmark(options));
+    results.push_back(run_with_progress("false_sharing_padded", [&] {
+      return run_false_sharing_benchmark<PaddedCounters>(
+          "false_sharing_padded", options, "cacheline_padded_atomic_counters");
+    }));
 
-    std::cout << "sink=" << g_benchmark_sink << "\n";
+    results.push_back(run_with_progress("spsc_two_thread", [&] {
+      return run_spsc_two_thread_benchmark(options);
+    }));
+
+    results.push_back(run_with_progress("mutex_vector_spsc_two_thread", [&] {
+      return run_mutex_vector_spsc_two_thread_benchmark(options);
+    }));
+
+    results.push_back(run_with_progress("vector_spsc_two_thread", [&] {
+      return run_vector_spsc_two_thread_benchmark(options);
+    }));
+
+    std::cout << "\nsink=" << g_benchmark_sink << "\n";
     for (const BenchmarkResult& result : results) {
       print_result(result);
     }
