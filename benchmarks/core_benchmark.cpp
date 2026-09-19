@@ -34,6 +34,27 @@ namespace {
 
 volatile std::uint64_t g_benchmark_sink = 0U;
 
+#if defined(__GNUC__) || defined(__clang__)
+template <typename T>
+inline void DO_NOT_OPTIMIZE(T const& value) noexcept {
+  asm volatile("" : : "r,m"(value) : "memory");
+}
+#elif defined(_MSC_VER)
+template <typename T>
+inline void DO_NOT_OPTIMIZE(T const& value) noexcept {
+  _ReadWriteBarrier();
+  char const* volatile barrier = reinterpret_cast<char const*>(std::addressof(value));
+  (void)barrier;
+  _ReadWriteBarrier();
+}
+#else
+template <typename T>
+inline void DO_NOT_OPTIMIZE(T const& value) noexcept {
+  volatile auto const* p = std::addressof(value);
+  (void)p;
+}
+#endif
+
 struct BenchmarkOptions {
   std::uint64_t iterations{1000000U};
   std::uint64_t warmup_iterations{200000U};
@@ -790,6 +811,7 @@ int main(int argc, char** argv) {
               LOLAKIT_ASSERT(queue.try_push(i));
               auto value = queue.try_pop();
               LOLAKIT_ASSERT(value.has_value());
+              DO_NOT_OPTIMIZE(*value);
               local_sum += *value;
             }
             return local_sum;
@@ -807,6 +829,7 @@ int main(int argc, char** argv) {
             for (std::uint64_t i = 0; i < operations; ++i) {
               LOLAKIT_ASSERT(queue.try_push(i));
               LOLAKIT_ASSERT(queue.try_pop(value));
+              DO_NOT_OPTIMIZE(value);
               local_sum += value;
             }
             return local_sum;
@@ -824,6 +847,7 @@ int main(int argc, char** argv) {
             for (std::uint64_t i = 0; i < operations; ++i) {
               LOLAKIT_ASSERT(queue.try_push(i));
               LOLAKIT_ASSERT(queue.try_pop(value));
+              DO_NOT_OPTIMIZE(value);
               local_sum += value;
             }
             return local_sum;
@@ -841,6 +865,7 @@ int main(int argc, char** argv) {
               LOLAKIT_ASSERT(queue.try_push(i));
               auto value = queue.try_pop();
               LOLAKIT_ASSERT(value.has_value());
+              DO_NOT_OPTIMIZE(*value);
               local_sum += *value;
             }
             return local_sum;
@@ -859,6 +884,7 @@ int main(int argc, char** argv) {
                 for (std::uint64_t i = 0; i < operations; ++i) {
                   LOLAKIT_ASSERT(queue.try_push(i));
                   LOLAKIT_ASSERT(queue.try_pop(value));
+                  DO_NOT_OPTIMIZE(value);
                   local_sum += value;
                 }
                 return local_sum;
@@ -877,6 +903,7 @@ int main(int argc, char** argv) {
                 for (std::uint64_t i = 0; i < operations; ++i) {
                   LOLAKIT_ASSERT(queue.try_push(i));
                   LOLAKIT_ASSERT(queue.try_pop(value));
+                  DO_NOT_OPTIMIZE(value);
                   local_sum += value;
                 }
                 return local_sum;
@@ -894,6 +921,7 @@ int main(int argc, char** argv) {
               LOLAKIT_ASSERT(queue.try_push(i));
               auto value = queue.try_pop();
               LOLAKIT_ASSERT(value.has_value());
+              DO_NOT_OPTIMIZE(*value);
               local_sum += *value;
             }
             return local_sum;
@@ -912,6 +940,7 @@ int main(int argc, char** argv) {
                 for (std::uint64_t i = 0; i < operations; ++i) {
                   LOLAKIT_ASSERT(queue.try_push(i));
                   LOLAKIT_ASSERT(queue.try_pop(value));
+                  DO_NOT_OPTIMIZE(value);
                   local_sum += value;
                 }
                 return local_sum;
@@ -929,6 +958,7 @@ int main(int argc, char** argv) {
             for (std::uint64_t i = 0; i < operations; ++i) {
               LOLAKIT_ASSERT(queue.try_push(i));
               LOLAKIT_ASSERT(queue.try_pop(value));
+              DO_NOT_OPTIMIZE(value);
               local_sum += value;
             }
             return local_sum;
