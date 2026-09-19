@@ -8,6 +8,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 #include "lolakit/core.hpp"
@@ -31,6 +33,14 @@ class DemoNonCopyable final : private lolakit::core::NonCopyable {
   int value() const noexcept { return 7; }
 };
 
+std::uint32_t current_process_id() noexcept {
+#if defined(_WIN32)
+  return static_cast<std::uint32_t>(::GetCurrentProcessId());
+#else
+  return static_cast<std::uint32_t>(::getpid());
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -42,7 +52,7 @@ int main() {
   lolakit::core::TrivialSpscRingBuffer<std::uint64_t, 8> trivial_queue;
   using DemoSharedQueue = lolakit::core::SharedMemorySpscQueue<64, 8>;
   DemoNonCopyable non_copyable;
-  const std::string mapping_name = "smoke." + std::to_string(::GetCurrentProcessId());
+  const std::string mapping_name = "smoke." + std::to_string(current_process_id());
   auto shm_producer = DemoSharedQueue::open(mapping_name);
   auto shm_consumer = DemoSharedQueue::attach(mapping_name);
 
@@ -66,8 +76,13 @@ int main() {
   LOLAKIT_ASSERT(non_copyable.value() == 7);
   LOLAKIT_ASSERT(queue.empty());
   LOLAKIT_ASSERT(trivial_queue.empty());
+#if defined(_WIN32)
   LOLAKIT_ASSERT(shm_producer.is_open());
   LOLAKIT_ASSERT(shm_consumer.is_open());
+#else
+  LOLAKIT_ASSERT(!shm_producer.is_open());
+  LOLAKIT_ASSERT(!shm_consumer.is_open());
+#endif
 
   LOLAKIT_ASSERT(lolakit::core::TscClock::now_cycles() > 0U);
   LOLAKIT_ASSERT(lolakit::core::TscClock::now_ns() > 0U);
@@ -92,6 +107,7 @@ int main() {
   LOLAKIT_ASSERT(trivial_value == 7U);
   LOLAKIT_ASSERT(trivial_queue.empty());
 
+#if defined(_WIN32)
   const std::string_view payload = "gamma";
   LOLAKIT_ASSERT(shm_producer.try_push(payload.data(),
                                        static_cast<std::uint32_t>(payload.size())));
@@ -100,6 +116,9 @@ int main() {
   LOLAKIT_ASSERT(shm_consumer.try_pop(buffer, sizeof(buffer), size));
   LOLAKIT_ASSERT(size == payload.size());
   LOLAKIT_ASSERT(std::string(buffer, buffer + size) == payload);
+#else
+  (void)mapping_name;
+#endif
 
   spin_wait.pause();
   spin_wait.reset();

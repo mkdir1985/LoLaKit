@@ -18,6 +18,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 #include "lolakit/core.hpp"
@@ -104,11 +106,19 @@ struct DclpSingletonProbe
 
 std::atomic<int> DclpSingletonProbe::ctor_count{0};
 
+std::uint32_t current_process_id() noexcept {
+#if defined(_WIN32)
+  return static_cast<std::uint32_t>(::GetCurrentProcessId());
+#else
+  return static_cast<std::uint32_t>(::getpid());
+#endif
+}
+
 std::string unique_shared_memory_name(const char* suffix) {
   const auto ticks = static_cast<std::uint64_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
   return std::string("unit.") + suffix + "." +
-         std::to_string(::GetCurrentProcessId()) + "." + std::to_string(ticks);
+         std::to_string(current_process_id()) + "." + std::to_string(ticks);
 }
 
 void test_atomic_helpers() {
@@ -384,6 +394,276 @@ void test_shared_memory_spsc_queue() {
   LOLAKIT_TEST_ASSERT(std::memcmp(buffer, payload, sizeof(payload)) == 0);
 }
 
+void test_mutex_vector_spsc_capacity_and_fifo() {
+  lolakit::core::MutexVectorSpscQueue<int, 8> queue;
+
+  LOLAKIT_TEST_ASSERT(queue.empty());
+  LOLAKIT_TEST_ASSERT(!queue.full());
+
+  for (int i = 0; i < 8; ++i) {
+    LOLAKIT_TEST_ASSERT(queue.try_push(i));
+  }
+
+  LOLAKIT_TEST_ASSERT(queue.full());
+  LOLAKIT_TEST_ASSERT(queue.size() == 8U);
+  LOLAKIT_TEST_ASSERT(!queue.try_push(9));
+
+  for (int i = 0; i < 8; ++i) {
+    auto value = queue.try_pop();
+    LOLAKIT_TEST_ASSERT(value.has_value());
+    LOLAKIT_TEST_ASSERT(*value == i);
+  }
+
+  LOLAKIT_TEST_ASSERT(queue.empty());
+  LOLAKIT_TEST_ASSERT(!queue.try_pop().has_value());
+}
+
+void test_mutex_vector_spsc_wraparound_and_clear() {
+  LOLAKIT_TEST_ASSERT(TrackedValue::live_count.load(std::memory_order_relaxed) ==
+                      0);
+
+  {
+    lolakit::core::MutexVectorSpscQueue<TrackedValue, 4> queue;
+
+    for (int i = 0; i < 4; ++i) {
+      LOLAKIT_TEST_ASSERT(queue.emplace(i));
+    }
+
+    LOLAKIT_TEST_ASSERT(
+        TrackedValue::live_count.load(std::memory_order_relaxed) == 4);
+
+    for (int i = 0; i < 2; ++i) {
+      auto value = queue.try_pop();
+      LOLAKIT_TEST_ASSERT(value.has_value());
+      LOLAKIT_TEST_ASSERT(value->value == i);
+    }
+
+    LOLAKIT_TEST_ASSERT(
+        TrackedValue::live_count.load(std::memory_order_relaxed) == 2);
+
+    LOLAKIT_TEST_ASSERT(queue.emplace(4));
+    LOLAKIT_TEST_ASSERT(queue.emplace(5));
+    LOLAKIT_TEST_ASSERT(queue.full());
+
+    queue.clear();
+    LOLAKIT_TEST_ASSERT(queue.empty());
+    LOLAKIT_TEST_ASSERT(
+        TrackedValue::live_count.load(std::memory_order_relaxed) == 0);
+  }
+
+  LOLAKIT_TEST_ASSERT(TrackedValue::live_count.load(std::memory_order_relaxed) ==
+                      0);
+}
+
+void test_mutex_vector_spsc_threaded_roundtrip() {
+  constexpr std::uint64_t kMessageCount = 200000U;
+  lolakit::core::MutexVectorSpscQueue<std::uint64_t, 1024> queue;
+  std::atomic<bool> producer_done{false};
+  std::atomic<std::uint64_t> consumed_sum{0U};
+
+  std::thread producer([&]() {
+    lolakit::core::SpinWait wait;
+    for (std::uint64_t i = 0; i < kMessageCount; ++i) {
+      while (!queue.try_push(i)) {
+        wait.pause();
+      }
+      wait.reset();
+    }
+    producer_done.store(true, std::memory_order_release);
+  });
+
+  std::thread consumer([&]() {
+    lolakit::core::SpinWait wait;
+    std::uint64_t expected = 0U;
+    std::uint64_t local_sum = 0U;
+
+    while (expected < kMessageCount) {
+      auto value = queue.try_pop();
+      if (!value.has_value()) {
+        if (producer_done.load(std::memory_order_acquire)) {
+          wait.pause();
+        } else {
+          wait.pause();
+        }
+        continue;
+      }
+
+      LOLAKIT_TEST_ASSERT(*value == expected);
+      local_sum += *value;
+      ++expected;
+      wait.reset();
+    }
+
+    consumed_sum.store(local_sum, std::memory_order_release);
+  });
+
+  producer.join();
+  consumer.join();
+
+  const std::uint64_t expected_sum =
+      (kMessageCount - 1U) * kMessageCount / 2U;
+  LOLAKIT_TEST_ASSERT(consumed_sum.load(std::memory_order_acquire) ==
+                      expected_sum);
+  LOLAKIT_TEST_ASSERT(queue.empty());
+}
+
+void test_trivial_mutex_vector_spsc_capacity_and_fifo() {
+  lolakit::core::TrivialMutexVectorSpscQueue<std::uint64_t, 8> queue;
+
+  LOLAKIT_TEST_ASSERT(queue.empty());
+  LOLAKIT_TEST_ASSERT(!queue.full());
+
+  for (std::uint64_t i = 0; i < 8U; ++i) {
+    LOLAKIT_TEST_ASSERT(queue.try_push(i));
+  }
+
+  LOLAKIT_TEST_ASSERT(queue.full());
+  LOLAKIT_TEST_ASSERT(queue.size() == 8U);
+
+  for (std::uint64_t i = 0; i < 8U; ++i) {
+    std::uint64_t value = 0U;
+    LOLAKIT_TEST_ASSERT(queue.try_pop(value));
+    LOLAKIT_TEST_ASSERT(value == i);
+  }
+
+  LOLAKIT_TEST_ASSERT(queue.empty());
+}
+
+void test_vector_spsc_capacity_and_fifo() {
+  lolakit::core::VectorSpscRingBuffer<int, 8> queue;
+
+  LOLAKIT_TEST_ASSERT(queue.empty());
+  LOLAKIT_TEST_ASSERT(!queue.full());
+
+  for (int i = 0; i < 8; ++i) {
+    LOLAKIT_TEST_ASSERT(queue.try_push(i));
+  }
+
+  LOLAKIT_TEST_ASSERT(queue.full());
+  LOLAKIT_TEST_ASSERT(queue.size() == 8U);
+  LOLAKIT_TEST_ASSERT(!queue.try_push(9));
+
+  for (int i = 0; i < 8; ++i) {
+    auto value = queue.try_pop();
+    LOLAKIT_TEST_ASSERT(value.has_value());
+    LOLAKIT_TEST_ASSERT(*value == i);
+  }
+
+  LOLAKIT_TEST_ASSERT(queue.empty());
+  LOLAKIT_TEST_ASSERT(!queue.try_pop().has_value());
+}
+
+void test_vector_spsc_wraparound_and_clear() {
+  LOLAKIT_TEST_ASSERT(TrackedValue::live_count.load(std::memory_order_relaxed) ==
+                      0);
+
+  {
+    lolakit::core::VectorSpscRingBuffer<TrackedValue, 4> queue;
+
+    for (int i = 0; i < 4; ++i) {
+      LOLAKIT_TEST_ASSERT(queue.emplace(i));
+    }
+
+    LOLAKIT_TEST_ASSERT(
+        TrackedValue::live_count.load(std::memory_order_relaxed) == 4);
+
+    for (int i = 0; i < 2; ++i) {
+      auto value = queue.try_pop();
+      LOLAKIT_TEST_ASSERT(value.has_value());
+      LOLAKIT_TEST_ASSERT(value->value == i);
+    }
+
+    LOLAKIT_TEST_ASSERT(
+        TrackedValue::live_count.load(std::memory_order_relaxed) == 2);
+
+    LOLAKIT_TEST_ASSERT(queue.emplace(4));
+    LOLAKIT_TEST_ASSERT(queue.emplace(5));
+    LOLAKIT_TEST_ASSERT(queue.full());
+
+    queue.clear();
+    LOLAKIT_TEST_ASSERT(queue.empty());
+    LOLAKIT_TEST_ASSERT(
+        TrackedValue::live_count.load(std::memory_order_relaxed) == 0);
+  }
+
+  LOLAKIT_TEST_ASSERT(TrackedValue::live_count.load(std::memory_order_relaxed) ==
+                      0);
+}
+
+void test_vector_spsc_threaded_roundtrip() {
+  constexpr std::uint64_t kMessageCount = 200000U;
+  lolakit::core::VectorSpscRingBuffer<std::uint64_t, 1024> queue;
+  std::atomic<bool> producer_done{false};
+  std::atomic<std::uint64_t> consumed_sum{0U};
+
+  std::thread producer([&]() {
+    lolakit::core::SpinWait wait;
+    for (std::uint64_t i = 0; i < kMessageCount; ++i) {
+      while (!queue.try_push(i)) {
+        wait.pause();
+      }
+      wait.reset();
+    }
+    producer_done.store(true, std::memory_order_release);
+  });
+
+  std::thread consumer([&]() {
+    lolakit::core::SpinWait wait;
+    std::uint64_t expected = 0U;
+    std::uint64_t local_sum = 0U;
+
+    while (expected < kMessageCount) {
+      auto value = queue.try_pop();
+      if (!value.has_value()) {
+        if (producer_done.load(std::memory_order_acquire)) {
+          wait.pause();
+        } else {
+          wait.pause();
+        }
+        continue;
+      }
+
+      LOLAKIT_TEST_ASSERT(*value == expected);
+      local_sum += *value;
+      ++expected;
+      wait.reset();
+    }
+
+    consumed_sum.store(local_sum, std::memory_order_release);
+  });
+
+  producer.join();
+  consumer.join();
+
+  const std::uint64_t expected_sum =
+      (kMessageCount - 1U) * kMessageCount / 2U;
+  LOLAKIT_TEST_ASSERT(consumed_sum.load(std::memory_order_acquire) ==
+                      expected_sum);
+  LOLAKIT_TEST_ASSERT(queue.empty());
+}
+
+void test_trivial_vector_spsc_capacity_and_fifo() {
+  lolakit::core::TrivialVectorSpscRingBuffer<std::uint64_t, 8> queue;
+
+  LOLAKIT_TEST_ASSERT(queue.empty());
+  LOLAKIT_TEST_ASSERT(!queue.full());
+
+  for (std::uint64_t i = 0; i < 8U; ++i) {
+    LOLAKIT_TEST_ASSERT(queue.try_push(i));
+  }
+
+  LOLAKIT_TEST_ASSERT(queue.full());
+  LOLAKIT_TEST_ASSERT(queue.size() == 8U);
+
+  for (std::uint64_t i = 0; i < 8U; ++i) {
+    std::uint64_t value = 0U;
+    LOLAKIT_TEST_ASSERT(queue.try_pop(value));
+    LOLAKIT_TEST_ASSERT(value == i);
+  }
+
+  LOLAKIT_TEST_ASSERT(queue.empty());
+}
+
 int run_test(const std::string& name, const std::function<void()>& test) {
   try {
     test();
@@ -409,7 +689,17 @@ int main() {
       {"spsc_wraparound_and_clear", test_spsc_wraparound_and_clear},
       {"spsc_threaded_roundtrip", test_spsc_threaded_roundtrip},
       {"trivial_spsc_capacity_and_fifo", test_trivial_spsc_capacity_and_fifo},
+#if defined(_WIN32)
       {"shared_memory_spsc_queue", test_shared_memory_spsc_queue},
+#endif
+      {"mutex_vector_spsc_capacity_and_fifo", test_mutex_vector_spsc_capacity_and_fifo},
+      {"mutex_vector_spsc_wraparound_and_clear", test_mutex_vector_spsc_wraparound_and_clear},
+      {"mutex_vector_spsc_threaded_roundtrip", test_mutex_vector_spsc_threaded_roundtrip},
+      {"trivial_mutex_vector_spsc_capacity_and_fifo", test_trivial_mutex_vector_spsc_capacity_and_fifo},
+      {"vector_spsc_capacity_and_fifo", test_vector_spsc_capacity_and_fifo},
+      {"vector_spsc_wraparound_and_clear", test_vector_spsc_wraparound_and_clear},
+      {"vector_spsc_threaded_roundtrip", test_vector_spsc_threaded_roundtrip},
+      {"trivial_vector_spsc_capacity_and_fifo", test_trivial_vector_spsc_capacity_and_fifo},
   };
 
   int failures = 0;

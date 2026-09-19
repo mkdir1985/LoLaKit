@@ -29,6 +29,15 @@ if(MSVC)
       /W4
       /wd4324
   )
+else()
+  target_compile_options(
+    lolakit_core
+    INTERFACE
+      -Wall
+      -Wextra
+      -Wno-padded
+      -Wno-c99-extensions
+  )
 endif()
 
 enable_testing()
@@ -44,6 +53,12 @@ if(MSVC)
   target_compile_options(lolakit_core_unit_tests PRIVATE /EHsc)
 endif()
 
+if(NOT WIN32)
+  find_package(Threads REQUIRED)
+  target_link_libraries(lolakit_core_smoke PRIVATE Threads::Threads)
+  target_link_libraries(lolakit_core_unit_tests PRIVATE Threads::Threads)
+endif()
+
 add_test(NAME lolakit_core_smoke COMMAND lolakit_core_smoke)
 add_test(NAME lolakit_core_unit_tests COMMAND lolakit_core_unit_tests)
 
@@ -51,11 +66,22 @@ if(LOLAKIT_BUILD_BENCHMARKS)
   add_executable(lolakit_core_benchmark benchmarks/core_benchmark.cpp)
   target_link_libraries(lolakit_core_benchmark PRIVATE lolakit::core)
 
-  add_executable(lolakit_io_benchmark benchmarks/io_benchmark.cpp)
-  target_link_libraries(lolakit_io_benchmark PRIVATE lolakit::core)
-
   if(MSVC)
     target_compile_options(lolakit_core_benchmark PRIVATE /EHsc)
-    target_compile_options(lolakit_io_benchmark PRIVATE /EHsc)
+  endif()
+
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(lolakit_core_benchmark PRIVATE Threads::Threads)
+  endif()
+
+  if(WIN32)
+    add_executable(lolakit_io_benchmark benchmarks/io_benchmark.cpp)
+    target_link_libraries(lolakit_io_benchmark PRIVATE lolakit::core)
+
+    if(MSVC)
+      target_compile_options(lolakit_io_benchmark PRIVATE /EHsc)
+    endif()
   endif()
 endif()
+

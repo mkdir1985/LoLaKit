@@ -18,8 +18,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#else
-#error "SharedMemorySpscQueue currently supports Windows only."
 #endif
 
 namespace lolakit {
@@ -88,11 +86,17 @@ class SharedMemorySpscQueue {
   static constexpr std::size_t capacity() noexcept { return Capacity; }
 
   bool empty() const noexcept {
+#if defined(_WIN32)
     return atomic_load_acquire(header_->producer_index.value()) ==
            atomic_load_acquire(header_->consumer_index.value());
+#else
+    (void)header_;
+    return true;
+#endif
   }
 
   bool full() noexcept {
+#if defined(_WIN32)
     const std::size_t producer = atomic_load_relaxed(header_->producer_index.value());
     std::size_t consumer_cache = producer_cached_consumer_;
 
@@ -102,15 +106,25 @@ class SharedMemorySpscQueue {
     }
 
     return producer - consumer_cache == Capacity;
+#else
+    (void)producer_cached_consumer_;
+    return true;
+#endif
   }
 
   std::size_t size() const noexcept {
+#if defined(_WIN32)
     const std::size_t producer = atomic_load_acquire(header_->producer_index.value());
     const std::size_t consumer = atomic_load_acquire(header_->consumer_index.value());
     return producer - consumer;
+#else
+    (void)header_;
+    return 0U;
+#endif
   }
 
   bool try_push(const void* data, std::uint32_t size) noexcept {
+#if defined(_WIN32)
     if (data == nullptr || size == 0U || size > PayloadSize || !is_open()) {
       return false;
     }
@@ -131,6 +145,13 @@ class SharedMemorySpscQueue {
     slot.size = size;
     atomic_store_release(header_->producer_index.value(), producer + 1U);
     return true;
+#else
+    (void)data;
+    (void)size;
+    (void)producer_cached_consumer_;
+    last_error_ = kErrorNotSupported;
+    return false;
+#endif
   }
 
   template <typename T>
@@ -144,6 +165,7 @@ class SharedMemorySpscQueue {
 
   bool try_pop(void* out, std::uint32_t out_capacity, std::uint32_t& size) noexcept {
     size = 0U;
+#if defined(_WIN32)
     if (out == nullptr || !is_open()) {
       return false;
     }
@@ -169,6 +191,13 @@ class SharedMemorySpscQueue {
     size = slot.size;
     atomic_store_release(header_->consumer_index.value(), consumer + 1U);
     return true;
+#else
+    (void)out;
+    (void)out_capacity;
+    (void)consumer_cached_producer_;
+    last_error_ = kErrorNotSupported;
+    return false;
+#endif
   }
 
   template <typename T>
@@ -184,6 +213,7 @@ class SharedMemorySpscQueue {
   }
 
   void close() noexcept {
+#if defined(_WIN32)
     if (view_ != nullptr) {
       ::UnmapViewOfFile(view_);
       view_ = nullptr;
@@ -198,9 +228,17 @@ class SharedMemorySpscQueue {
     created_ = false;
     producer_cached_consumer_ = 0U;
     consumer_cached_producer_ = 0U;
+#else
+    header_ = nullptr;
+    slots_ = nullptr;
+    created_ = false;
+    producer_cached_consumer_ = 0U;
+    consumer_cached_producer_ = 0U;
+#endif
   }
 
  private:
+#if defined(_WIN32)
   struct LayoutHeader {
     std::uint32_t magic{0U};
     std::uint32_t version{0U};
@@ -349,6 +387,42 @@ class SharedMemorySpscQueue {
   std::uint32_t last_error_{0U};
   std::size_t producer_cached_consumer_{0U};
   std::size_t consumer_cached_producer_{0U};
+#else
+  static constexpr std::uint32_t kErrorNotSupported = 0xFFFFFFFFU;
+
+  struct LayoutHeader;
+  struct Slot;
+
+  void move_from(SharedMemorySpscQueue&& other) noexcept {
+    header_ = other.header_;
+    slots_ = other.slots_;
+    created_ = other.created_;
+    last_error_ = other.last_error_;
+    producer_cached_consumer_ = other.producer_cached_consumer_;
+    consumer_cached_producer_ = other.consumer_cached_producer_;
+
+    other.header_ = nullptr;
+    other.slots_ = nullptr;
+    other.created_ = false;
+    other.last_error_ = 0U;
+    other.producer_cached_consumer_ = 0U;
+    other.consumer_cached_producer_ = 0U;
+  }
+
+  void open_internal(const std::string& name, OpenMode mode) noexcept {
+    (void)name;
+    (void)mode;
+    close();
+    last_error_ = kErrorNotSupported;
+  }
+
+  LayoutHeader* header_{nullptr};
+  Slot* slots_{nullptr};
+  bool created_{false};
+  std::uint32_t last_error_{0U};
+  std::size_t producer_cached_consumer_{0U};
+  std::size_t consumer_cached_producer_{0U};
+#endif
 };
 
 }  // namespace core
