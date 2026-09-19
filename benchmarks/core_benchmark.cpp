@@ -787,8 +787,7 @@ int main(int argc, char** argv) {
             lolakit::core::SpscRingBuffer<std::uint64_t, 1024> queue;
             std::uint64_t local_sum = 0U;
             for (std::uint64_t i = 0; i < operations; ++i) {
-              while (!queue.try_push(i)) {
-              }
+              LOLAKIT_ASSERT(queue.try_push(i));
               auto value = queue.try_pop();
               LOLAKIT_ASSERT(value.has_value());
               local_sum += *value;
@@ -806,8 +805,7 @@ int main(int argc, char** argv) {
             std::uint64_t local_sum = 0U;
             std::uint64_t value = 0U;
             for (std::uint64_t i = 0; i < operations; ++i) {
-              while (!queue.try_push(i)) {
-              }
+              LOLAKIT_ASSERT(queue.try_push(i));
               LOLAKIT_ASSERT(queue.try_pop(value));
               local_sum += value;
             }
@@ -824,8 +822,7 @@ int main(int argc, char** argv) {
             std::uint64_t local_sum = 0U;
             std::uint64_t value = 0U;
             for (std::uint64_t i = 0; i < operations; ++i) {
-              while (!queue.try_push(i)) {
-              }
+              LOLAKIT_ASSERT(queue.try_push(i));
               LOLAKIT_ASSERT(queue.try_pop(value));
               local_sum += value;
             }
@@ -841,8 +838,7 @@ int main(int argc, char** argv) {
             lolakit::core::MutexVectorSpscQueue<std::uint64_t, 1024> queue;
             std::uint64_t local_sum = 0U;
             for (std::uint64_t i = 0; i < operations; ++i) {
-              while (!queue.try_push(i)) {
-              }
+              LOLAKIT_ASSERT(queue.try_push(i));
               auto value = queue.try_pop();
               LOLAKIT_ASSERT(value.has_value());
               local_sum += *value;
@@ -861,8 +857,7 @@ int main(int argc, char** argv) {
                 std::uint64_t local_sum = 0U;
                 std::uint64_t value = 0U;
                 for (std::uint64_t i = 0; i < operations; ++i) {
-                  while (!queue.try_push(i)) {
-                  }
+                  LOLAKIT_ASSERT(queue.try_push(i));
                   LOLAKIT_ASSERT(queue.try_pop(value));
                   local_sum += value;
                 }
@@ -880,8 +875,7 @@ int main(int argc, char** argv) {
                 std::uint64_t local_sum = 0U;
                 std::uint64_t value = 0U;
                 for (std::uint64_t i = 0; i < operations; ++i) {
-                  while (!queue.try_push(i)) {
-                  }
+                  LOLAKIT_ASSERT(queue.try_push(i));
                   LOLAKIT_ASSERT(queue.try_pop(value));
                   local_sum += value;
                 }
@@ -897,8 +891,7 @@ int main(int argc, char** argv) {
             lolakit::core::VectorSpscRingBuffer<std::uint64_t, 1024> queue;
             std::uint64_t local_sum = 0U;
             for (std::uint64_t i = 0; i < operations; ++i) {
-              while (!queue.try_push(i)) {
-              }
+              LOLAKIT_ASSERT(queue.try_push(i));
               auto value = queue.try_pop();
               LOLAKIT_ASSERT(value.has_value());
               local_sum += *value;
@@ -917,8 +910,7 @@ int main(int argc, char** argv) {
                 std::uint64_t local_sum = 0U;
                 std::uint64_t value = 0U;
                 for (std::uint64_t i = 0; i < operations; ++i) {
-                  while (!queue.try_push(i)) {
-                  }
+                  LOLAKIT_ASSERT(queue.try_push(i));
                   LOLAKIT_ASSERT(queue.try_pop(value));
                   local_sum += value;
                 }
@@ -935,8 +927,7 @@ int main(int argc, char** argv) {
             std::uint64_t local_sum = 0U;
             std::uint64_t value = 0U;
             for (std::uint64_t i = 0; i < operations; ++i) {
-              while (!queue.try_push(i)) {
-              }
+              LOLAKIT_ASSERT(queue.try_push(i));
               LOLAKIT_ASSERT(queue.try_pop(value));
               local_sum += value;
             }
